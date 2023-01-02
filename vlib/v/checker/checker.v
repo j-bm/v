@@ -95,6 +95,7 @@ mut:
 	vweb_gen_types                   []ast.Type // vweb route checks
 	timers                           &util.Timers = util.get_timers()
 	for_in_any_val_type              ast.Type
+	comptime_for_field_var           string
 	comptime_fields_default_type     ast.Type
 	comptime_fields_type             map[string]ast.Type
 	fn_scope                         &ast.Scope = unsafe { nil }
@@ -1182,7 +1183,13 @@ fn (mut c Checker) selector_expr(mut node ast.SelectorExpr) ast.Type {
 			}
 		}
 	}
-
+	// evaluates comptime field.<name> (from T.fields)
+	if c.check_comptime_is_field_selector(node) {
+		if c.check_comptime_is_field_selector_bool(node) {
+			node.expr_type = ast.bool_type
+			return node.expr_type
+		}
+	}
 	old_selector_expr := c.inside_selector_expr
 	c.inside_selector_expr = true
 	mut typ := c.expr(node.expr)
@@ -2266,7 +2273,11 @@ pub fn (mut c Checker) expr(node_ ast.Expr) ast.Type {
 		ast.ArrayDecompose {
 			typ := c.expr(node.expr)
 			type_sym := c.table.sym(typ)
-			if type_sym.kind != .array {
+			if type_sym.kind == .array_fixed {
+				c.error('direct decomposition of fixed array is not allowed, convert the fixed array to normal array via ${node.expr}[..]',
+					node.expr.pos())
+				return ast.void_type
+			} else if type_sym.kind != .array {
 				c.error('decomposition can only be used on arrays', node.expr.pos())
 				return ast.void_type
 			}

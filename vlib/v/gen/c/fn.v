@@ -652,7 +652,7 @@ fn (mut g Gen) call_expr(node ast.CallExpr) {
 			g.expr(node.left)
 			g.writeln(';')
 			g.write(tmp_var)
-		} else {
+		} else if node.or_block.kind == .absent {
 			g.expr(node.left)
 		}
 	} else if node.left is ast.IndexExpr && node.name == '' {
@@ -695,6 +695,9 @@ fn (mut g Gen) call_expr(node ast.CallExpr) {
 			g.write('${tmp_opt} = ')
 		} else {
 			g.write('${styp} ${tmp_opt} = ')
+			if node.left is ast.AnonFn {
+				g.expr(node.left)
+			}
 		}
 	}
 	if node.is_method && !node.is_field {
@@ -941,6 +944,26 @@ fn (mut g Gen) method_call(node ast.CallExpr) {
 		return
 	} else if left_sym.kind == .array && node.name == 'delete' {
 		g.write('array_delete(')
+		if left_type.has_flag(.shared_f) {
+			if left_type.is_ptr() {
+				g.write('&')
+			}
+			g.expr(node.left)
+			g.write('->val')
+		} else {
+			if left_type.is_ptr() {
+				g.expr(node.left)
+			} else {
+				g.write('&')
+				g.expr(node.left)
+			}
+		}
+		g.write(', ')
+		g.expr(node.args[0].expr)
+		g.write(')')
+		return
+	} else if left_sym.kind == .array && node.name == 'drop' {
+		g.write('array_drop(')
 		if left_type.has_flag(.shared_f) {
 			if left_type.is_ptr() {
 				g.write('&')
@@ -1234,6 +1257,7 @@ fn (mut g Gen) fn_call(node ast.CallExpr) {
 	mut is_interface_call := false
 	mut is_selector_call := false
 	mut has_comptime_field := false
+	mut comptime_args := []int{}
 	if node.left_type != 0 {
 		left_sym := g.table.sym(node.left_type)
 		if left_sym.kind == .interface_ {
@@ -1266,10 +1290,12 @@ fn (mut g Gen) fn_call(node ast.CallExpr) {
 					node_.args[i].typ = call_arg.expr.obj.typ
 					if call_arg.expr.obj.is_comptime_field {
 						has_comptime_field = true
+						comptime_args << i
 					}
 				}
 			} else if mut call_arg.expr is ast.ComptimeSelector {
 				has_comptime_field = true
+				comptime_args << i
 			}
 		}
 	}
@@ -1362,7 +1388,16 @@ fn (mut g Gen) fn_call(node ast.CallExpr) {
 			if func.generic_names.len > 0 {
 				if g.comptime_for_field_type != 0 && g.inside_comptime_for_field
 					&& has_comptime_field {
-					name = g.generic_fn_name([g.comptime_for_field_type], name)
+					mut concrete_types := node.concrete_types.map(g.unwrap_generic(it))
+					arg_sym := g.table.sym(g.comptime_for_field_type)
+					for k in comptime_args {
+						if arg_sym.kind == .array {
+							concrete_types[k] = (arg_sym.info as ast.Array).elem_type
+						} else {
+							concrete_types[k] = g.comptime_for_field_type
+						}
+					}
+					name = g.generic_fn_name(concrete_types, name)
 				} else {
 					concrete_types := node.concrete_types.map(g.unwrap_generic(it))
 					name = g.generic_fn_name(concrete_types, name)
@@ -1719,8 +1754,7 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 					exp_sym := g.table.sym(expected_types[i])
 					orig_sym := g.table.sym(arg.expr.obj.orig_type)
 					if orig_sym.kind != .interface_ && (exp_sym.kind != .sum_type
-						|| (exp_sym.kind == .sum_type
-						&& expected_types[i] != arg.expr.obj.orig_type)) {
+						&& expected_types[i] != arg.expr.obj.orig_type) {
 						expected_types[i] = g.unwrap_generic(arg.expr.obj.smartcasts.last())
 						cast_sym := g.table.sym(expected_types[i])
 						if cast_sym.info is ast.Aggregate {

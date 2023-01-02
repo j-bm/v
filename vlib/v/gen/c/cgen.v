@@ -157,6 +157,7 @@ mut:
 	defer_vars                []string
 	str_types                 []StrType       // types that need automatic str() generation
 	generated_str_fns         []StrType       // types that already have a str() function
+	str_fn_names              []string        // remove duplicate function names
 	threaded_fns              shared []string // for generating unique wrapper types and fns for `go xxx()`
 	waiter_fns                shared []string // functions that wait for `go xxx()` to finish
 	needed_equality_fns       []ast.Type
@@ -196,6 +197,7 @@ mut:
 	comptime_for_field_value         ast.StructField // value of the field variable
 	comptime_for_field_type          ast.Type        // type of the field variable inferred from `$if field.typ is T {}`
 	comptime_var_type_map            map[string]ast.Type
+	comptime_values_stack            []CurrentComptimeValues // stores the values from the above on each $for loop, to make nesting them easier
 	prevent_sum_type_unwrapping_once bool // needed for assign new values to sum type
 	// used in match multi branch
 	// TypeOne, TypeTwo {}
@@ -319,19 +321,22 @@ pub fn gen(files []&ast.File, table &ast.Table, pref &pref.Preferences) (string,
 		global_g.write_tests_definitions()
 	}
 
-	global_g.timers.start('cgen init')
+	util.timing_start('cgen init')
 	for mod in global_g.table.modules {
 		global_g.cleanups[mod] = strings.new_builder(100)
 	}
 	global_g.init()
-	global_g.timers.show('cgen init')
+	util.timing_measure('cgen init')
 	global_g.tests_inited = false
 	global_g.file = files.last()
 	if !pref.no_parallel {
+		util.timing_start('cgen parallel processing')
 		mut pp := pool.new_pool_processor(callback: cgen_process_one_file_cb)
 		pp.set_shared_context(global_g) // TODO: make global_g shared
 		pp.work_on_items(files)
-		global_g.timers.start('cgen unification')
+		util.timing_measure('cgen parallel processing')
+
+		util.timing_start('cgen unification')
 		// tg = thread gen
 		for g in pp.get_results_ref[Gen]() {
 			global_g.embedded_files << g.embedded_files
@@ -416,12 +421,15 @@ pub fn gen(files []&ast.File, table &ast.Table, pref &pref.Preferences) (string,
 			}
 		}
 	} else {
+		util.timing_start('cgen serial processing')
 		for file in files {
 			global_g.file = file
 			global_g.gen_file()
 			global_g.cleanups[file.mod.name].drain_builder(mut global_g.cleanup, 100)
 		}
-		global_g.timers.start('cgen unification')
+		util.timing_measure('cgen serial processing')
+
+		util.timing_start('cgen unification')
 	}
 
 	global_g.gen_jsons()
@@ -442,10 +450,10 @@ pub fn gen(files []&ast.File, table &ast.Table, pref &pref.Preferences) (string,
 	global_g.write_results()
 	global_g.write_optionals()
 	global_g.sort_globals_consts()
-	global_g.timers.show('cgen unification')
+	util.timing_measure('cgen unification')
 
 	mut g := global_g
-	g.timers.start('cgen common')
+	util.timing_start('cgen common')
 	// to make sure type idx's are the same in cached mods
 	if g.pref.build_mode == .build_module {
 		for idx, sym in g.table.type_symbols {
@@ -588,7 +596,7 @@ pub fn gen(files []&ast.File, table &ast.Table, pref &pref.Preferences) (string,
 	out_str := g.out.str()
 	b.write_string(out_str) // g.out.str())
 	b.writeln('\n// THE END.')
-	g.timers.show('cgen common')
+	util.timing_measure('cgen common')
 	res := b.str()
 	$if trace_all_generic_fn_keys ? {
 		gkeys := g.table.fn_generic_types.keys()
@@ -1736,7 +1744,9 @@ fn (mut g Gen) stmts_with_tmp_var(stmts []ast.Stmt, tmp_var string) bool {
 				g.set_current_pos_as_last_stmt_pos()
 				g.skip_stmt_pos = true
 				mut is_noreturn := false
-				if stmt is ast.ExprStmt {
+				if stmt is ast.Return {
+					is_noreturn = true
+				} else if stmt is ast.ExprStmt {
 					is_noreturn = is_noreturn_callexpr(stmt.expr)
 				}
 				if !is_noreturn {
@@ -2482,8 +2492,9 @@ fn (mut g Gen) expr_with_cast(expr ast.Expr, got_type_raw ast.Type, expected_typ
 					tmp_var := g.new_tmp_var()
 					g.write('${got_styp} ${tmp_var} = ')
 					g.expr(expr)
-					g.write(';')
+					g.writeln(';')
 					g.write(stmt_str)
+					g.write(' ')
 					g.write('${fname}(&${tmp_var})')
 					return
 				} else {
@@ -3303,11 +3314,7 @@ fn (mut g Gen) expr(node_ ast.Expr) {
 			}
 		}
 		ast.IsRefType {
-			typ := if node.typ == g.field_data_type {
-				g.comptime_for_field_value.typ
-			} else {
-				node.typ
-			}
+			typ := g.get_type(node.typ)
 			node_typ := g.unwrap_generic(typ)
 			sym := g.table.sym(node_typ)
 			if sym.language == .v && sym.kind in [.placeholder, .any] {
@@ -3504,7 +3511,7 @@ fn (mut g Gen) char_literal(node ast.CharLiteral) {
 
 // T.name, typeof(expr).name
 fn (mut g Gen) type_name(raw_type ast.Type) {
-	typ := if raw_type == g.field_data_type { g.comptime_for_field_value.typ } else { raw_type }
+	typ := g.get_type(raw_type)
 	sym := g.table.sym(typ)
 	mut s := ''
 	if sym.kind == .function {
@@ -3520,11 +3527,7 @@ fn (mut g Gen) type_name(raw_type ast.Type) {
 }
 
 fn (mut g Gen) typeof_expr(node ast.TypeOf) {
-	typ := if node.typ == g.field_data_type {
-		g.comptime_for_field_value.typ
-	} else {
-		node.typ
-	}
+	typ := g.get_type(node.typ)
 	sym := g.table.sym(typ)
 	if sym.kind == .sum_type {
 		// When encountering a .sum_type, typeof() should be done at runtime,
@@ -3547,6 +3550,22 @@ fn (mut g Gen) typeof_expr(node ast.TypeOf) {
 	}
 }
 
+fn (mut g Gen) comptime_typeof(node ast.TypeOf, default_type ast.Type) ast.Type {
+	if node.expr is ast.ComptimeSelector {
+		if node.expr.field_expr is ast.SelectorExpr {
+			if node.expr.field_expr.expr is ast.Ident {
+				key_str := '${node.expr.field_expr.expr.name}.typ'
+				return g.comptime_var_type_map[key_str] or { default_type }
+			}
+		}
+	} else if g.inside_comptime_for_field && node.expr is ast.Ident
+		&& (node.expr as ast.Ident).obj is ast.Var && ((node.expr as ast.Ident).obj as ast.Var).is_comptime_field == true {
+		// typeof(var) from T.fields
+		return g.comptime_for_field_type
+	}
+	return default_type
+}
+
 fn (mut g Gen) selector_expr(node ast.SelectorExpr) {
 	prevent_sum_type_unwrapping_once := g.prevent_sum_type_unwrapping_once
 	g.prevent_sum_type_unwrapping_once = false
@@ -3566,20 +3585,17 @@ fn (mut g Gen) selector_expr(node ast.SelectorExpr) {
 					// typeof(expr).name
 					mut name_type := node.name_type
 					if node.expr is ast.TypeOf {
-						if node.expr.expr is ast.ComptimeSelector {
-							if node.expr.expr.field_expr is ast.SelectorExpr {
-								if node.expr.expr.field_expr.expr is ast.Ident {
-									key_str := '${node.expr.expr.field_expr.expr.name}.typ'
-									name_type = g.comptime_var_type_map[key_str] or { name_type }
-								}
-							}
-						}
+						name_type = g.comptime_typeof(node.expr, name_type)
 					}
 					g.type_name(name_type)
 					return
 				} else if node.field_name == 'idx' {
+					mut name_type := node.name_type
+					if node.expr is ast.TypeOf {
+						name_type = g.comptime_typeof(node.expr, name_type)
+					}
 					// `typeof(expr).idx`
-					g.write(int(g.unwrap_generic(node.name_type)).str())
+					g.write(int(g.unwrap_generic(name_type)).str())
 					return
 				}
 				g.error('unknown generic field', node.pos)
@@ -5363,6 +5379,7 @@ fn (mut g Gen) write_sorted_types() {
 }
 
 fn (mut g Gen) write_types(symbols []&ast.TypeSymbol) {
+	mut struct_names := map[string]bool{}
 	for sym in symbols {
 		if sym.name.starts_with('C.') {
 			continue
@@ -5377,7 +5394,10 @@ fn (mut g Gen) write_types(symbols []&ast.TypeSymbol) {
 		mut name := sym.cname
 		match sym.info {
 			ast.Struct {
-				g.struct_decl(sym.info, name, false)
+				if !struct_names[name] {
+					g.struct_decl(sym.info, name, false)
+					struct_names[name] = true
+				}
 			}
 			ast.Alias {
 				// ast.Alias { TODO
@@ -5401,9 +5421,10 @@ fn (mut g Gen) write_types(symbols []&ast.TypeSymbol) {
 				}
 			}
 			ast.SumType {
-				if sym.info.is_generic {
+				if sym.info.is_generic || struct_names[name] {
 					continue
 				}
+				struct_names[name] = true
 				g.typedefs.writeln('typedef struct ${name} ${name};')
 				g.type_definitions.writeln('')
 				g.type_definitions.writeln('// Union sum type ${name} = ')
@@ -5936,8 +5957,13 @@ fn (g Gen) get_all_test_function_names() []string {
 	return all_tfuncs
 }
 
+[inline]
+fn (mut g Gen) get_type(typ ast.Type) ast.Type {
+	return if typ == g.field_data_type { g.comptime_for_field_value.typ } else { typ }
+}
+
 fn (mut g Gen) size_of(node ast.SizeOf) {
-	typ := if node.typ == g.field_data_type { g.comptime_for_field_value.typ } else { node.typ }
+	typ := g.get_type(node.typ)
 	node_typ := g.unwrap_generic(typ)
 	sym := g.table.sym(node_typ)
 	if sym.language == .v && sym.kind in [.placeholder, .any] {
@@ -6050,6 +6076,10 @@ fn (g Gen) has_been_referenced(fn_name string) bool {
 
 // Generates interface table and interface indexes
 fn (mut g Gen) interface_table() string {
+	util.timing_start(@METHOD)
+	defer {
+		util.timing_measure(@METHOD)
+	}
 	mut sb := strings.new_builder(100)
 	mut conversion_functions := strings.new_builder(100)
 	for isym in g.table.type_symbols {
